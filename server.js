@@ -12,25 +12,23 @@ const PORT = Number(process.env.PORT || 10000);
 
 let ws = null;
 let running = true;
-
 let sessionStartTs = null;
 let lastPongTs = null;
 
 let currentGame = {
   gameId: null,
   status: null,
+  delta: null,
   players: {},
-  totalPlayers: 0,
-  totalDeposit: 0,
-  delta: null
 };
 
-let collectingBets = false; // флаг сбора ставок — мы теперь включаем его после finalizeGame
+let collectingBets = true; // Всегда включается сразу после очистки кэша игры
 
-const finishedGames = [];
 const logs = [];
+const finishedGames = [];
 
 function nowIso(){ return new Date().toISOString(); }
+
 function pushLog(type, extra = {}) {
   const entry = { type, ts: nowIso(), ...extra };
   logs.push(entry);
@@ -57,17 +55,14 @@ function colorForCrash(c){
   return "gradient";
 }
 
-// ЛОГИРОВАНИЕ
 let sentPlayersToAI = false;
-let sentDeltaLogForHUD = false;
-let startedStatus1Log = false;
+let sentDeltaStartHUD = false;
 
-
-// --- Обработка ставки ---
+// --- Обработка ставок ---
 function handleBet(bet){
   if (!bet?.user?.id) return;
-
-  if (!collectingBets) return; // не собираем, если отключено
+  if (!collectingBets) return;
+  if (currentGame.status !== 1) return;  // ПРИНИМАЕМ ТОЛЬКО НА status=1
 
   const id = bet.user.id;
   const sum = Number(bet.deposit?.amount || 0);
@@ -84,11 +79,6 @@ function handleBet(bet){
     currentGame.players[id].sum += sum;
     currentGame.players[id].lastCoefficientAuto = auto;
   }
-
-  if (!startedStatus1Log) {
-    console.log("[COLLECT] Собираю игроков");
-    startedStatus1Log = true;
-  }
 }
 
 
@@ -98,61 +88,50 @@ function handleUpdate(data){
 
   if (typeof data.status === "number") {
     currentGame.status = data.status;
+  }
 
-    // ВАЖНО: теперь статус 1 НЕ включает сбор ставок
-    // collectingBets включается ТОЛЬКО после finalizeGame()
+  if (typeof data.delta === "number") {
+    currentGame.delta = data.delta;
+  }
 
-    // Статус 2 ОСТАНАВЛИВАЕТ сбор ставок
-    if (data.status === 2) {
-      collectingBets = false;
+  if (currentGame.status === 2) {
+    if (!sentPlayersToAI) {
+      const totalPlayers = Object.keys(currentGame.players).length;
+      const totalDeposit = Object.values(currentGame.players).reduce((s,p)=>s+p.sum,0);
+
+      console.log(`[AI] Players collected: players=${totalPlayers} sum=${totalDeposit}`);
+      pushLog("SEND_TO_AI", {
+        gameId: currentGame.gameId,
+        totalPlayers,
+        totalDeposit
+      });
+
+      sentPlayersToAI = true;
     }
-  }
 
-  if (typeof data.delta === "number") currentGame.delta = data.delta;
-
-  if (currentGame.status !== 1) {
-    startedStatus1Log = false;
-  }
-
-  // Когда статус 2 — фиксируем игроков и старт делты
-  if (currentGame.status === 2 && !sentPlayersToAI) {
-    const arr = Object.values(currentGame.players);
-    const totalPlayers = arr.length;
-    const totalDeposit = arr.reduce((s,p)=>s+p.sum,0);
-
-    console.log(`[AI] Игроки собраны | количество: ${totalPlayers} | сумма ставок: ${totalDeposit}`);
-
-    pushLog("SEND_TO_AI", {
-      gameId: currentGame.gameId,
-      message: "Игроки собраны",
-      totalPlayers,
-      totalDeposit
-    });
-
-    sentPlayersToAI = true;
-  }
-
-  if (currentGame.status === 2 && !sentDeltaLogForHUD) {
-    console.log(`[HUD] delta START => ${currentGame.delta}`);
-    pushLog("HUD_DELTA_START", { delta: currentGame.delta });
-    sentDeltaLogForHUD = true;
+    if (!sentDeltaStartHUD) {
+      console.log(`[HUD] Delta START: ${currentGame.delta}`);
+      pushLog("HUD_DELTA_START", { delta: currentGame.delta });
+      sentDeltaStartHUD = true;
+    }
   }
 }
 
 
 // --- Финализация игры ---
 function finalizeGame(data){
-  const gameId = data.id || data.gameId || currentGame.gameId;
-  const crash = data.crash;
+  const crash = Number(data.crash);
+  const gameId = data.gameId || currentGame.gameId;
   const color = colorForCrash(crash);
 
   const playersArr = Object.values(currentGame.players);
   const totalPlayers = playersArr.length;
   const totalDeposit = playersArr.reduce((s,p)=>s+p.sum,0);
 
-  console.log(`[AI] game=${gameId} crash=${crash} color=${color} + [HUD] crash=${crash}`);
+  console.log(`[AI] Crash: game=${gameId} x${crash} color=${color}`);
+  console.log(`[HUD] Crash => x${crash}`);
 
-  const final = {
+  const finalRecord = {
     gameId,
     crash,
     color,
@@ -162,39 +141,36 @@ function finalizeGame(data){
     ts: nowIso()
   };
 
-  console.log(`[DB] Игра сохранена game=${gameId} crash=${crash} players=${totalPlayers} totalDeposit=${totalDeposit}`);
+  finishedGames.unshift(finalRecord);
+  if (finishedGames.length > 50) finishedGames.pop();
 
-  finishedGames.unshift(final);
-  if (finishedGames.length > 1) finishedGames.pop();
+  console.log(`[DB] Game saved: players=${totalPlayers}`);
 
-  // --- ПОЛНЫЙ СБРОС ИГРЫ ---
+  // --- Очистка игры ---
   currentGame = {
     gameId: null,
     status: null,
-    players: {},
-    totalPlayers: 0,
-    totalDeposit: 0,
-    delta: null
+    delta: null,
+    players: {}
   };
 
   sentPlayersToAI = false;
-  sentDeltaLogForHUD = false;
-  startedStatus1Log = false;
+  sentDeltaStartHUD = false;
 
-  // ВАЖНО ❗: НОВАЯ ИГРА — НАЧИНАЕМ СОБИРАТЬ СТАВКИ
+  // --- Снова готовы собирать ставки ---
   collectingBets = true;
-  console.log("[NEW_GAME] Приём ставок включён сразу после финализации");
+  console.log("[NEW_GAME] Bets collection enabled");
 }
 
 
-// --- Обработка входящих сообщений WebSocket ---
+// --- Обработка входящих сообщений ---
 function onPush(msg){
   const data = msg.push?.pub?.data;
   if (!data) return;
 
   const type = data.type;
 
-  if (type === "crash" || type === "end") {
+  if (type === "crash") {
     return finalizeGame(data);
   }
 
@@ -202,19 +178,27 @@ function onPush(msg){
     return handleUpdate(data);
   }
 
-  if (type === "betCreated" && collectingBets) {
-    handleBet(data.bet);
+  if (type === "betCreated") {
+    return handleBet(data.bet);
   }
+
+  // Игнорируем:
+  //  topBetCreated
+  //  changeStatistic
+  //  start
+  //  other stuff
 }
 
 
-// --- Подключение WebSocket ---
+// --- Подключение WS ---
 function attachWs(ws){
   ws.on("open", async () => {
     sessionStartTs = Date.now();
     pushLog("WS_OPEN");
+
     const token = await fetchToken();
     ws.send(JSON.stringify({ id:1, connect:{ token, subs:{} } }));
+
     setTimeout(()=>{
       ws.send(JSON.stringify({ id:100, subscribe:{ channel:CHANNEL } }));
     },200);
@@ -254,7 +238,6 @@ http.createServer((req, res) => {
   if (req.url === "/dd") {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("Shutting down...\n");
-
     running = false;
     try { if (ws) ws.close(); } catch(e) {}
     setTimeout(() => process.exit(0), 500);
