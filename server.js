@@ -205,35 +205,12 @@ async function loop(){
   }
 }
 
-http.createServer((req,res)=>{
-  if (req.url === "/status") {
-    res.end(JSON.stringify({
-      ts: nowIso(),
-      connected: ws?.readyState === WebSocket.OPEN,
-      game: { gameId: currentGame.gameId, status: currentGame.status }
-    }, null, 2));
+http.createServer((req, res) => {
+  if (req.url === "/game/history") {
+    res.end(JSON.stringify({ count: finishedGames.length, games: finishedGames }, null, 2));
     return;
   }
-
-  if (req.url === "/game/current"){
-    res.end(JSON.stringify({
-      ts: nowIso(),
-      game: {
-        gameId: currentGame.gameId,
-        status: currentGame.status,
-        delta: currentGame.delta,
-        players: Object.values(currentGame.players)
-      }
-    }, null, 2));
-    return;
-  }
-
-  if (req.url === "/game/history"){
-    res.end(JSON.stringify({ count: finishedGames.length, games: finishedGames.slice(0,50) }, null, 2));
-    return;
-  }
-
   res.end("ok");
-}).listen(PORT, ()=> console.log("HTTP listen", PORT));
+}).listen(PORT, () => console.log("HTTP listen", PORT));
 
 loop();
