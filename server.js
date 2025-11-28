@@ -67,23 +67,45 @@ function extractAllBets(obj, bets = []) {
   const stack = [obj];
 
   while (stack.length) {
-    const current = stack.pop();
-    if (!current || typeof current !== "object") continue;
+    const node = stack.pop();
+    if (!node || typeof node !== "object") continue;
 
-    // Добавляем все ставки на этом уровне
-    if (current.bet) bets.push(current.bet);
-    if (current.b) bets.push(current.b);
-
-    // Если массив — добавляем элементы в стек
-    if (Array.isArray(current)) {
-      for (let i = current.length - 1; i >= 0; i--) stack.push(current[i]);
-      continue;
+    // Прямые ставки
+    if (node.bet && node.bet.user && node.bet.deposit) {
+      bets.push(node.bet);
     }
 
-    // Добавляем все объекты в стек
-    for (const key in current) {
-      const value = current[key];
-      if (value && typeof value === "object") stack.push(value);
+    // Иногда ставка идёт как payload.bet
+    if (node.payload?.bet && node.payload.bet.user) {
+      bets.push(node.payload.bet);
+    }
+
+    // Иногда ставки идут как массив "bets"
+    if (Array.isArray(node.bets)) {
+      node.bets.forEach(b => {
+        if (b?.user && b?.deposit) bets.push(b);
+      });
+    }
+
+    // Иногда ставки идут в "state.bets"
+    if (Array.isArray(node.state?.bets)) {
+      node.state.bets.forEach(b => {
+        if (b?.user && b?.deposit) bets.push(b);
+      });
+    }
+
+    // Иногда ставка без ключа "bet", просто объект с user + deposit
+    if (node.user && node.deposit) {
+      bets.push(node);
+    }
+
+    // Рекурсивный обход
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) stack.push(node[i]);
+    } else {
+      for (const k in node) {
+        if (typeof node[k] === "object") stack.push(node[k]);
+      }
     }
   }
 
