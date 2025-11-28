@@ -25,6 +25,8 @@ let currentGame = {
   delta: null
 };
 
+let collectingBets = false; // <--- ВАЖНО: флаг включения сбора ставок
+
 const finishedGames = [];
 const logs = [];
 
@@ -55,7 +57,7 @@ function colorForCrash(c){
   return "gradient";
 }
 
-// Флаги для логов
+// ЛОГИРОВАНИЕ
 let sentPlayersToAI = false;
 let sentDeltaLogForHUD = false;
 let startedStatus1Log = false;
@@ -65,8 +67,7 @@ let startedStatus1Log = false;
 function handleBet(bet){
   if (!bet?.user?.id) return;
 
-  // Только при статусе 1
-  if (currentGame.status !== 1) return;
+  if (!collectingBets) return; // <--- Гарантия: собираем только в статусе 1
 
   const id = bet.user.id;
   const sum = Number(bet.deposit?.amount || 0);
@@ -80,37 +81,50 @@ function handleBet(bet){
       lastCoefficientAuto: auto
     };
   } else {
+    // Сайт НЕ даёт ставить повторно, но оставляю на всякий
     currentGame.players[id].sum += sum;
     currentGame.players[id].lastCoefficientAuto = auto;
   }
 
-  // Лог один раз при начале статуса 1
   if (!startedStatus1Log) {
     console.log("[STATUS1] Собираю игроков");
     startedStatus1Log = true;
   }
 }
 
-// --- Обработка обновления статуса ---
+
+// --- Обновление статуса игры ---
 function handleUpdate(data){
   if (data.id) currentGame.gameId = data.id;
-  if (typeof data.status === "number") currentGame.status = data.status;
+
+  if (typeof data.status === "number") {
+    currentGame.status = data.status;
+
+    // ВКЛЮЧЕНИЕ/ВЫКЛЮЧЕНИЕ СБОРА СТАВОК
+    if (data.status === 1) {
+      collectingBets = true;     // ← включаем сбор ставок
+    } else {
+      collectingBets = false;    // ← выключаем
+    }
+  }
+
   if (typeof data.delta === "number") currentGame.delta = data.delta;
 
   if (currentGame.status !== 1) startedStatus1Log = false;
 
-  // Статус 1 → 2 впервые
+  // Когда статус 1 → 2 — отправляем игроков
   if (currentGame.status === 2 && !sentPlayersToAI) {
-    const arr = Object.values(currentGame.players); // уникальные игроки
+    const arr = Object.values(currentGame.players);
     const totalPlayers = arr.length;
     const totalDeposit = arr.reduce((s,p)=>s+p.sum,0);
 
     console.log(`[AI] Игроки собраны | количество: ${totalPlayers} | сумма ставок: ${totalDeposit}`);
+
     pushLog("SEND_TO_AI", {
-        gameId: currentGame.gameId,
-        message: "Игроки собраны",
-        totalPlayers,
-        totalDeposit
+      gameId: currentGame.gameId,
+      message: "Игроки собраны",
+      totalPlayers,
+      totalDeposit
     });
 
     sentPlayersToAI = true;
@@ -122,6 +136,7 @@ function handleUpdate(data){
     sentDeltaLogForHUD = true;
   }
 }
+
 
 // --- Финализация игры ---
 function finalizeGame(data){
@@ -150,14 +165,17 @@ function finalizeGame(data){
   finishedGames.unshift(final);
   if (finishedGames.length > 1) finishedGames.pop();
 
+  // Полный сброс состояния игры
   currentGame = { gameId: null, status: null, players: {}, totalPlayers: 0, totalDeposit: 0, delta: null };
   sentPlayersToAI = false;
   sentDeltaLogForHUD = false;
   startedStatus1Log = false;
+  collectingBets = false;
 }
 
-// --- Обработка сообщений WS ---
-function onPush(msg) {
+
+// --- Обработка входящих сообщений WebSocket ---
+function onPush(msg){
   const data = msg.push?.pub?.data;
   if (!data) return;
 
@@ -165,15 +183,14 @@ function onPush(msg) {
 
   if (type === "crash" || type === "end") return finalizeGame(data);
 
-  if (type === "update") {
-      handleUpdate(data);
-      return;
-  }
+  if (type === "update") return handleUpdate(data);
 
-  if (collectingBets && type === "betCreated") {
-      handleBet(data.bet);
+  // Ставки идут ТОЛЬКО из betCreated
+  if (type === "betCreated" && collectingBets) {
+    handleBet(data.bet);
   }
 }
+
 
 // --- Подключение WebSocket ---
 function attachWs(ws){
@@ -202,12 +219,12 @@ function attachWs(ws){
 }
 
 async function loop(){
-  while(running){
+  while (running){
     try{
       ws = new WebSocket(WS_URL);
       attachWs(ws);
       await new Promise(res=>ws.once("close",res));
-    } catch{}
+    } catch {}
     await new Promise(r=>setTimeout(r,2000));
   }
 }
@@ -222,11 +239,8 @@ http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("Shutting down...\n");
 
-    console.log("[SERVER] Shutdown initiated via /shutdown endpoint");
-    pushLog({ type: "shutdown_endpoint", reason: "manual_request" });
-
     running = false;
-    try { if (ws) ws.close(); } catch(e) { console.error("[SERVER] Error closing WS:", e.message); }
+    try { if (ws) ws.close(); } catch(e) {}
     setTimeout(() => process.exit(0), 500);
     return;
   }
