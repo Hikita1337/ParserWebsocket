@@ -204,12 +204,32 @@ async function loop(){
     await new Promise(r=>setTimeout(r,2000));
   }
 }
-
 http.createServer((req, res) => {
   if (req.url === "/game/history") {
     res.end(JSON.stringify({ count: finishedGames.length, games: finishedGames }, null, 2));
     return;
   }
+
+  if (req.url === "/dd") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Shutting down...\n");
+
+    console.log("[SERVER] Shutdown initiated via /shutdown endpoint");
+    pushLog({ type: "shutdown_endpoint", reason: "manual_request" });
+
+    // Остановить основной цикл и закрыть WS
+    running = false;
+    try {
+      if (ws) ws.close();
+    } catch (e) {
+      console.error("[SERVER] Error closing WS:", e.message);
+    }
+
+    // Небольшая задержка перед полным выходом, чтобы обработались события
+    setTimeout(() => process.exit(0), 500);
+    return;
+  }
+
   res.end("ok");
 }).listen(PORT, () => console.log("HTTP listen", PORT));
 
