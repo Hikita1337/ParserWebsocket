@@ -1,4 +1,3 @@
-
 // server.js — парсер WebSocket -> краткий рабочий код (ESM)
 // Установка: npm i
 // Запуск: node server.js
