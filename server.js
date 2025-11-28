@@ -60,57 +60,6 @@ let sentPlayersToAI = false;
 let sentDeltaLogForHUD = false;
 let startedStatus1Log = false;
 
-// --- Рекурсивная и безопасная функция для извлечения всех ставок ---
-function extractAllBets(obj, bets = []) {
-  if (!obj || typeof obj !== "object") return bets;
-
-  const stack = [obj];
-
-  while (stack.length) {
-    const node = stack.pop();
-    if (!node || typeof node !== "object") continue;
-
-    // Прямые ставки
-    if (node.bet && node.bet.user && node.bet.deposit) {
-      bets.push(node.bet);
-    }
-
-    // Иногда ставка идёт как payload.bet
-    if (node.payload?.bet && node.payload.bet.user) {
-      bets.push(node.payload.bet);
-    }
-
-    // Иногда ставки идут как массив "bets"
-    if (Array.isArray(node.bets)) {
-      node.bets.forEach(b => {
-        if (b?.user && b?.deposit) bets.push(b);
-      });
-    }
-
-    // Иногда ставки идут в "state.bets"
-    if (Array.isArray(node.state?.bets)) {
-      node.state.bets.forEach(b => {
-        if (b?.user && b?.deposit) bets.push(b);
-      });
-    }
-
-    // Иногда ставка без ключа "bet", просто объект с user + deposit
-    if (node.user && node.deposit) {
-      bets.push(node);
-    }
-
-    // Рекурсивный обход
-    if (Array.isArray(node)) {
-      for (let i = 0; i < node.length; i++) stack.push(node[i]);
-    } else {
-      for (const k in node) {
-        if (typeof node[k] === "object") stack.push(node[k]);
-      }
-    }
-  }
-
-  return bets;
-}
 
 // --- Обработка ставки ---
 function handleBet(bet){
@@ -208,7 +157,7 @@ function finalizeGame(data){
 }
 
 // --- Обработка сообщений WS ---
-function onPush(msg){
+function onPush(msg) {
   const data = msg.push?.pub?.data;
   if (!data) return;
 
@@ -216,12 +165,13 @@ function onPush(msg){
 
   if (type === "crash" || type === "end") return finalizeGame(data);
 
-  if (type === "update") handleUpdate(data);
+  if (type === "update") {
+      handleUpdate(data);
+      return;
+  }
 
-  // Сбор всех ставок только при статусе 1
-  if (currentGame.status === 1) {
-    const bets = extractAllBets(data);
-    bets.forEach(handleBet);
+  if (collectingBets && type === "betCreated") {
+      handleBet(data.bet);
   }
 }
 
