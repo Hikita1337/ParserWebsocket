@@ -129,27 +129,28 @@ function finalizeGame(data){
   const totalPlayers = playersArr.length;
   const totalDeposit = playersArr.reduce((s,p)=>s+p.sum,0);
 
+  // Отправка AI + HUD в одну строку
+  console.log(`[AI] game=${gameId} crash=${crash} color=${color} + [HUD] crash=${crash}`);
+
+  // Подготовка объекта для базы
   const final = {
-    gameId, crash, color, players: playersArr,
-    totalPlayers, totalDeposit, ts: nowIso()
+    gameId,
+    crash,
+    color,
+    players: playersArr,
+    totalPlayers,
+    totalDeposit,
+    ts: nowIso()
   };
+
+  // Заглушка сохранения в базу
+  // saveToDB(final);
+  console.log(`[DB] Игра сохранена game=${gameId} crash=${crash} players=${totalPlayers} totalDeposit=${totalDeposit}`);
 
   finishedGames.unshift(final);
   if (finishedGames.length > 500) finishedGames.pop();
 
-  // Лог финала
-  pushLog("GAME_FINAL", { gameId, crash, color, totalPlayers, totalDeposit });
-
-  // Отправка в AI
-  console.log(`[AI] crash => game=${gameId} crash=${crash} color=${color}`);
-
-  // Отправка финального краша в HUD
-  console.log(`[HUD] final crash => ${crash}`);
-
-  // Здесь по логике можно сохранить в базу:
-  // saveToDB(final);
-
-  // Очистка
+  // Очистка текущей игры
   currentGame = { gameId: null, status: null, players: {}, totalPlayers: 0, totalDeposit: 0, delta: null };
   sentPlayersToAI = false;
   sentDeltaLogForHUD = false;
