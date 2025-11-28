@@ -1,4 +1,4 @@
-// server.js — Crash Parser (robust message parsing + heartbeat)
+// server.js — Crash Parser (WebSocket)
 // Установка: npm i ws node-fetch
 
 import WebSocket from "ws";
@@ -19,14 +19,16 @@ let currentGame = {
   gameId: null,
   status: null,
   delta: null,
-  players: {}
+  players: {},
 };
 
-let collectingBets = true;
-const finishedGames = [];
+let collectingBets = true; // Всегда включается сразу после очистки кэша игры
+
 const logs = [];
+const finishedGames = [];
 
 function nowIso(){ return new Date().toISOString(); }
+
 function pushLog(type, extra = {}) {
   const entry = { type, ts: nowIso(), ...extra };
   logs.push(entry);
@@ -39,8 +41,7 @@ async function fetchToken(){
     const r = await fetch(TOKEN_URL);
     const j = await r.json();
     return j?.data?.main?.centrifugeToken || null;
-  } catch (e) {
-    pushLog("TOKEN_FETCH_ERR", { error: String(e) });
+  } catch {
     return null;
   }
 }
@@ -55,20 +56,13 @@ function colorForCrash(c){
 }
 
 let sentPlayersToAI = false;
-let sentDeltaLogForHUD = false;
+let sentDeltaStartHUD = false;
 
-// --- Bet handling ---
+// --- Обработка ставок ---
 function handleBet(bet){
   if (!bet?.user?.id) return;
   if (!collectingBets) return;
-  if (Number(bet.status) !== 1) return;
-
-  if (currentGame.status !== 1) {
-    currentGame.status = 1;
-    pushLog("INFER_STATUS_1", { fromBetId: bet.id, gameId: bet.gameId });
-  }
-
-  if (!currentGame.gameId && bet.gameId) currentGame.gameId = bet.gameId;
+  if (currentGame.status !== 1) return;  // ПРИНИМАЕМ ТОЛЬКО НА status=1
 
   const id = bet.user.id;
   const sum = Number(bet.deposit?.amount || 0);
@@ -87,228 +81,150 @@ function handleBet(bet){
   }
 }
 
-// --- Update handling ---
+
+// --- Обновление статуса игры ---
 function handleUpdate(data){
   if (data.id) currentGame.gameId = data.id;
-  if (typeof data.status === "number") currentGame.status = data.status;
-  if (typeof data.delta === "number") currentGame.delta = data.delta;
+
+  if (typeof data.status === "number") {
+    currentGame.status = data.status;
+  }
+
+  if (typeof data.delta === "number") {
+    currentGame.delta = data.delta;
+  }
 
   if (currentGame.status === 2) {
     if (!sentPlayersToAI) {
-      const arr = Object.values(currentGame.players);
-      const totalPlayers = arr.length;
-      const totalDeposit = arr.reduce((s,p)=>s+p.sum,0);
+      const totalPlayers = Object.keys(currentGame.players).length;
+      const totalDeposit = Object.values(currentGame.players).reduce((s,p)=>s+p.sum,0);
 
-      pushLog("SEND_TO_AI", { gameId: currentGame.gameId, totalPlayers, totalDeposit });
+      console.log(`[AI] Players collected: players=${totalPlayers} sum=${totalDeposit}`);
+      pushLog("SEND_TO_AI", {
+        gameId: currentGame.gameId,
+        totalPlayers,
+        totalDeposit
+      });
+
       sentPlayersToAI = true;
     }
 
-    if (!sentDeltaLogForHUD) {
+    if (!sentDeltaStartHUD) {
+      console.log(`[HUD] Delta START: ${currentGame.delta}`);
       pushLog("HUD_DELTA_START", { delta: currentGame.delta });
-      sentDeltaLogForHUD = true;
+      sentDeltaStartHUD = true;
     }
   }
 }
 
-// --- Finalize game ---
+
+// --- Финализация игры ---
 function finalizeGame(data){
   const crash = Number(data.crash);
-  const gameId = data.gameId || data.id || currentGame.gameId;
+  const gameId = data.gameId || currentGame.gameId;
   const color = colorForCrash(crash);
 
   const playersArr = Object.values(currentGame.players);
   const totalPlayers = playersArr.length;
   const totalDeposit = playersArr.reduce((s,p)=>s+p.sum,0);
 
-  pushLog("FINALIZE_GAME", { gameId, crash, color, totalPlayers, totalDeposit });
+  console.log(`[AI] Crash: game=${gameId} x${crash} color=${color}`);
+  console.log(`[HUD] Crash => x${crash}`);
 
-  const final = { gameId, crash, color, players: playersArr, totalPlayers, totalDeposit, ts: nowIso() };
+  const finalRecord = {
+    gameId,
+    crash,
+    color,
+    players: playersArr,
+    totalPlayers,
+    totalDeposit,
+    ts: nowIso()
+  };
 
-  // Заглушка: записать в БД здесь (заменить на свою функцию)
-  // saveGame(final)
+  finishedGames.unshift(finalRecord);
+  if (finishedGames.length > 1) finishedGames.pop();
 
-  finishedGames.unshift(final);
-  if (finishedGames.length > 100) finishedGames.pop();
+  console.log(`[DB] Game saved: players=${totalPlayers}`);
 
-  // Очистка кэша
-  currentGame = { gameId: null, status: null, delta: null, players: {} };
+  // --- Очистка игры ---
+  currentGame = {
+    gameId: null,
+    status: null,
+    delta: null,
+    players: {}
+  };
+
   sentPlayersToAI = false;
-  sentDeltaLogForHUD = false;
+  sentDeltaStartHUD = false;
 
-  // Включаем сбор ставок для новой игры
+  // --- Снова готовы собирать ставки ---
   collectingBets = true;
-  pushLog("NEW_GAME_READY", { msg: "Cache cleared, collecting bets enabled" });
+  console.log("[NEW_GAME] Bets collection enabled");
 }
 
-// --- Robust parse for multiple JSON objects in one frame ---
-function parsePossibleBatch(raw){
-  const results = [];
-  if (typeof raw === 'object' && raw !== null) {
-    results.push(raw);
-    return results;
-  }
 
-  let s = raw.toString();
-
-  try {
-    const parsed = JSON.parse(s);
-    results.push(parsed);
-    return results;
-  } catch (e) {
-    // continue to fragment extraction
-  }
-
-  let depth = 0;
-  let start = null;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (ch === '{') {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0 && start !== null) {
-        const piece = s.slice(start, i+1);
-        try {
-          const parsed = JSON.parse(piece);
-          results.push(parsed);
-        } catch (e) {
-          // debug, but keep processing
-          pushLog("PARSE_FRAGMENT_FAIL", { fragmentPreview: piece.slice(0,200) });
-        }
-        start = null;
-      }
-    }
-  }
-
-  if (results.length === 0) {
-    // best-effort detection for common push envelope
-    const re = /\{\"push\":\{.*?\}\}\}/g;
-    let m;
-    while ((m = re.exec(s)) !== null) {
-      try {
-        const parsed = JSON.parse(m[0]);
-        results.push(parsed);
-      } catch (e) {}
-    }
-  }
-
-  return results;
-}
-
-// --- Process one push object ---
-function onPushSingle(pushObj){
-  const data = pushObj.pub?.data;
+// --- Обработка входящих сообщений ---
+function onPush(msg){
+  const data = msg.push?.pub?.data;
   if (!data) return;
+
   const type = data.type;
 
-  if (type === "crash" || type === "end") {
-    finalizeGame(data);
-    return;
+  if (type === "crash") {
+    return finalizeGame(data);
   }
+
   if (type === "update") {
-    handleUpdate(data);
-    return;
+    return handleUpdate(data);
   }
+
   if (type === "betCreated") {
-    handleBet(data.bet);
-    return;
-  }
-  // ignore other types (topBetCreated, changeStatistic, etc.)
-}
-
-// --- High-level onPush that scans nested envelopes ---
-function onPush(p){
-  if (!p) return;
-  if (p.push && p.push.pub && p.push.pub.data) {
-    onPushSingle(p.push);
-    return;
+    return handleBet(data.bet);
   }
 
-  const scan = (obj) => {
-    if (!obj || typeof obj !== 'object') return;
-    if (obj.push && obj.push.pub && obj.push.pub.data) {
-      onPushSingle(obj.push);
-    } else {
-      for (const k in obj) {
-        if (Object.prototype.hasOwnProperty.call(obj,k) && typeof obj[k] === 'object') {
-          scan(obj[k]);
-        }
-      }
-    }
-  };
-  scan(p);
+  // Игнорируем:
+  //  topBetCreated
+  //  changeStatistic
+  //  start
+  //  other stuff
 }
 
-// --- Attach WS with heartbeat recovery ---
+
+// --- Подключение WS ---
 function attachWs(ws){
   ws.on("open", async () => {
     sessionStartTs = Date.now();
     pushLog("WS_OPEN");
+
     const token = await fetchToken();
-    try {
-      ws.send(JSON.stringify({ id:1, connect:{ token, subs:{} } }));
-      setTimeout(()=> ws.send(JSON.stringify({ id:100, subscribe:{ channel:CHANNEL } })), 200);
-    } catch (e) {
-      pushLog("WS_SEND_ERR", { error: String(e) });
-    }
+    ws.send(JSON.stringify({ id:1, connect:{ token, subs:{} } }));
+
+    setTimeout(()=>{
+      ws.send(JSON.stringify({ id:100, subscribe:{ channel:CHANNEL } }));
+    },200);
   });
 
   ws.on("message", d => {
-    // Try robust parse
-    const parsedList = parsePossibleBatch(d);
-
-    // If nothing parsed, we still reply with keepalive to avoid server closing
-    if (parsedList.length === 0) {
-      // Some servers send an empty object as ping: {}
-      try {
-        // respond with type:3 (centrifuge ping/pong semantics)
-        ws.send(JSON.stringify({ type: 3 }));
-        lastPongTs = Date.now();
-      } catch (e) {
-        pushLog("WS_PONG_SEND_ERR", { error: String(e) });
-      }
-      pushLog("UNPARSED_WS_FRAME", { preview: d.toString().slice(0,200) });
-      return;
-    }
-
-    for (const p of parsedList) {
-      try {
-        if (p?.push) {
-          onPush(p);
-        } else {
-          onPush(p);
-        }
-      } catch (e) {
-        pushLog("ONPUSH_ERR", { error: String(e), preview: JSON.stringify(p).slice(0,200) });
-      }
+    let p; try { p = JSON.parse(d); } catch {}
+    if (p?.push) return onPush(p);
+    if (p && Object.keys(p).length === 0) {
+      ws.send(JSON.stringify({ type:3 }));
+      lastPongTs = Date.now();
     }
   });
 
-  // Some servers use WebSocket pong frames; keep track
   ws.on("pong", ()=> lastPongTs = Date.now());
-
-  // If server sends an empty JSON object as a keepalive, it will appear parsed as {}
-  // In some runs we receive that as parsed object; respond to it:
-  // (Handled above in parse branch when parsedList is empty we send type:3)
-
-  ws.on("close", (code, reason) => {
-    pushLog("WS_CLOSE", { code, reason: reason && reason.toString ? reason.toString() : reason });
-  });
-  ws.on("error", e => pushLog("WS_ERROR", { error: String(e) }));
+  ws.on("close", ()=> pushLog("WS_CLOSE"));
+  ws.on("error", e=> pushLog("WS_ERROR",{error:String(e)}));
 }
 
-// --- main loop ---
 async function loop(){
   while (running){
     try{
       ws = new WebSocket(WS_URL);
       attachWs(ws);
       await new Promise(res=>ws.once("close",res));
-    } catch (e) {
-      pushLog("WS_LOOP_ERR", { error: String(e) });
-    }
-    // backoff before reconnect
+    } catch {}
     await new Promise(r=>setTimeout(r,2000));
   }
 }
@@ -316,11 +232,6 @@ async function loop(){
 http.createServer((req, res) => {
   if (req.url === "/game/history") {
     res.end(JSON.stringify({ count: finishedGames.length, games: finishedGames }, null, 2));
-    return;
-  }
-
-  if (req.url === "/debug/logs") {
-    res.end(JSON.stringify({ logs: logs.slice(-200) }, null, 2));
     return;
   }
 
@@ -337,3 +248,34 @@ http.createServer((req, res) => {
 }).listen(PORT, () => console.log("HTTP listen", PORT));
 
 loop();
+
+// =============================
+//       KEEP-ALIVE FOR RENDER
+// =============================
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || "https://parserwebsocket.onrender.com" ;
+
+function keepAlive() {
+  if (!SELF_URL) return;
+
+  const delay = 240000 + Math.random() * 120000; // 4–6 минут
+
+  setTimeout(async () => {
+    try {
+      await fetch(SELF_URL + "/healthz", {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "X-Keep-Alive": String(Math.random()),
+        },
+      });
+
+      console.log("Keep-alive ping OK");
+    } catch (e) {
+      console.log("Keep-alive error:", e.message);
+    }
+
+    keepAlive();
+  }, delay);
+}
+
+keepAlive();
