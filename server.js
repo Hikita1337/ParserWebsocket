@@ -1,4 +1,4 @@
-// server.js — Crash Parser (WebSocket)
+// server.js — Crash Parser (robust message parsing)
 // Установка: npm i ws node-fetch
 
 import WebSocket from "ws";
@@ -17,18 +17,16 @@ let lastPongTs = null;
 
 let currentGame = {
   gameId: null,
-  status: null,
+  status: null,   // 1 = accepting bets, 2 = delta, null = unknown/new
   delta: null,
-  players: {},
+  players: {}     // key = userId
 };
 
-let collectingBets = true; // Всегда включается сразу после очистки кэша игры
-
-const logs = [];
+let collectingBets = true; // enabled after cache cleared (finalizeGame sets it)
 const finishedGames = [];
+const logs = [];
 
 function nowIso(){ return new Date().toISOString(); }
-
 function pushLog(type, extra = {}) {
   const entry = { type, ts: nowIso(), ...extra };
   logs.push(entry);
@@ -41,7 +39,8 @@ async function fetchToken(){
     const r = await fetch(TOKEN_URL);
     const j = await r.json();
     return j?.data?.main?.centrifugeToken || null;
-  } catch {
+  } catch (e) {
+    pushLog("TOKEN_FETCH_ERR", { error: String(e) });
     return null;
   }
 }
@@ -56,13 +55,27 @@ function colorForCrash(c){
 }
 
 let sentPlayersToAI = false;
-let sentDeltaStartHUD = false;
+let sentDeltaLogForHUD = false;
 
-// --- Обработка ставок ---
+// --- Bet handling ---
 function handleBet(bet){
   if (!bet?.user?.id) return;
+
+  // Accept only if:
+  //  - bet.status === 1 (explicit from WS)
+  //  - AND collectingBets is true (we are in new-game mode)
   if (!collectingBets) return;
-  if (currentGame.status !== 1) return;  // ПРИНИМАЕМ ТОЛЬКО НА status=1
+  if (Number(bet.status) !== 1) return;
+
+  // If parser hasn't seen an update status=1 yet, but bet.status===1 —
+  // infer currentGame.status = 1 (helps with race conditions).
+  if (currentGame.status !== 1) {
+    currentGame.status = 1;
+    pushLog("INFER_STATUS_1", { fromBetId: bet.id, gameId: bet.gameId });
+  }
+
+  // Ensure gameId is populated
+  if (!currentGame.gameId && bet.gameId) currentGame.gameId = bet.gameId;
 
   const id = bet.user.id;
   const sum = Number(bet.deposit?.amount || 0);
@@ -81,25 +94,22 @@ function handleBet(bet){
   }
 }
 
-
-// --- Обновление статуса игры ---
+// --- Update handling ---
 function handleUpdate(data){
   if (data.id) currentGame.gameId = data.id;
 
   if (typeof data.status === "number") {
     currentGame.status = data.status;
   }
-
-  if (typeof data.delta === "number") {
-    currentGame.delta = data.delta;
-  }
+  if (typeof data.delta === "number") currentGame.delta = data.delta;
 
   if (currentGame.status === 2) {
+    // When status becomes 2 — we should snapshot players and send to AI (once)
     if (!sentPlayersToAI) {
-      const totalPlayers = Object.keys(currentGame.players).length;
-      const totalDeposit = Object.values(currentGame.players).reduce((s,p)=>s+p.sum,0);
+      const arr = Object.values(currentGame.players);
+      const totalPlayers = arr.length;
+      const totalDeposit = arr.reduce((s,p)=>s+p.sum,0);
 
-      console.log(`[AI] Players collected: players=${totalPlayers} sum=${totalDeposit}`);
       pushLog("SEND_TO_AI", {
         gameId: currentGame.gameId,
         totalPlayers,
@@ -109,29 +119,28 @@ function handleUpdate(data){
       sentPlayersToAI = true;
     }
 
-    if (!sentDeltaStartHUD) {
-      console.log(`[HUD] Delta START: ${currentGame.delta}`);
+    if (!sentDeltaLogForHUD) {
       pushLog("HUD_DELTA_START", { delta: currentGame.delta });
-      sentDeltaStartHUD = true;
+      sentDeltaLogForHUD = true;
     }
+
+    // Important: do NOT flip collectingBets here; bets will be filtered by bet.status === 1.
   }
 }
 
-
-// --- Финализация игры ---
+// --- Finalize game ---
 function finalizeGame(data){
   const crash = Number(data.crash);
-  const gameId = data.gameId || currentGame.gameId;
+  const gameId = data.gameId || data.id || currentGame.gameId;
   const color = colorForCrash(crash);
 
   const playersArr = Object.values(currentGame.players);
   const totalPlayers = playersArr.length;
   const totalDeposit = playersArr.reduce((s,p)=>s+p.sum,0);
 
-  console.log(`[AI] Crash: game=${gameId} x${crash} color=${color}`);
-  console.log(`[HUD] Crash => x${crash}`);
+  pushLog("FINALIZE_GAME", { gameId, crash, color, totalPlayers, totalDeposit });
 
-  const finalRecord = {
+  const final = {
     gameId,
     crash,
     color,
@@ -141,12 +150,13 @@ function finalizeGame(data){
     ts: nowIso()
   };
 
-  finishedGames.unshift(finalRecord);
-  if (finishedGames.length > 1) finishedGames.pop();
+  // DB write placeholder (replace with your function)
+  // saveGameToDb(final).catch(...)
 
-  console.log(`[DB] Game saved: players=${totalPlayers}`);
+  finishedGames.unshift(final);
+  if (finishedGames.length > 100) finishedGames.pop();
 
-  // --- Очистка игры ---
+  // Clear state (cache) AFTER DB write
   currentGame = {
     gameId: null,
     status: null,
@@ -155,61 +165,159 @@ function finalizeGame(data){
   };
 
   sentPlayersToAI = false;
-  sentDeltaStartHUD = false;
+  sentDeltaLogForHUD = false;
 
-  // --- Снова готовы собирать ставки ---
+  // Enable collecting bets for the next game
   collectingBets = true;
-  console.log("[NEW_GAME] Bets collection enabled");
+  pushLog("NEW_GAME_READY", { msg: "Cache cleared, collecting bets enabled" });
 }
 
+// --- Robust single-message parsing ---
+// Some incoming frames contain multiple JSON objects concatenated.
+// This function extracts JSON objects and returns array of parsed objects.
+function parsePossibleBatch(raw){
+  const results = [];
 
-// --- Обработка входящих сообщений ---
-function onPush(msg){
-  const data = msg.push?.pub?.data;
+  // If already an object (ws may deliver parsed objects sometimes)
+  if (typeof raw === 'object' && raw !== null) {
+    results.push(raw);
+    return results;
+  }
+
+  // raw is Buffer or string
+  let s = raw.toString();
+
+  // Fast path: single valid JSON
+  try {
+    const parsed = JSON.parse(s);
+    results.push(parsed);
+    return results;
+  } catch (e) {
+    // fallback to extract multiple JSON blocks
+  }
+
+  // Heuristic extraction:
+  // Replace "}\n{" and "}{", then try split by newline boundaries
+  // We'll scan for balanced braces and extract objects.
+  let depth = 0;
+  let start = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && start !== null) {
+        const piece = s.slice(start, i+1);
+        try {
+          const parsed = JSON.parse(piece);
+          results.push(parsed);
+        } catch (e) {
+          // ignore parse failure for this piece but log for debugging
+          pushLog("PARSE_FRAGMENT_FAIL", { fragment: piece.slice(0,200) });
+        }
+        start = null;
+      }
+    }
+  }
+
+  // If nothing parsed, as last resort try to find top-level "push" objects via regex
+  if (results.length === 0) {
+    const re = /{\"push\":.*?\}\}\}/g; // best-effort (will match some)
+    let m;
+    while ((m = re.exec(s)) !== null) {
+      try {
+        const parsed = JSON.parse(m[0]);
+        results.push(parsed);
+      } catch (e) {}
+    }
+  }
+
+  return results;
+}
+
+// --- onPush (process a single push entry) ---
+function onPushSingle(pushObj){
+  const data = pushObj.pub?.data;
   if (!data) return;
-
   const type = data.type;
 
-  if (type === "crash") {
-    return finalizeGame(data);
+  if (type === "crash" || type === "end") {
+    finalizeGame(data);
+    return;
   }
 
   if (type === "update") {
-    return handleUpdate(data);
+    handleUpdate(data);
+    return;
   }
 
+  // We only care about betCreated (ignore topBetCreated)
   if (type === "betCreated") {
-    return handleBet(data.bet);
+    handleBet(data.bet);
+    return;
   }
 
-  // Игнорируем:
-  //  topBetCreated
-  //  changeStatistic
-  //  start
-  //  other stuff
+  // ignore others but useful to log rare ones
+  // pushLog("IGNORED_PUSH", { type });
 }
 
+// --- main onPush for the parsed object(s) ---
+function onPush(p){
+  // p may contain push or be multiple; handle safely
+  if (!p) return;
 
-// --- Подключение WS ---
+  // If object is single push
+  if (p.push && p.push.pub && p.push.pub.data) {
+    onPushSingle(p.push);
+    return;
+  }
+
+  // If it's an envelope array or similar, try to find push.* entries
+  const scan = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    if (obj.push && obj.push.pub && obj.push.pub.data) {
+      onPushSingle(obj.push);
+    } else {
+      for (const k in obj) {
+        if (Object.prototype.hasOwnProperty.call(obj,k) && typeof obj[k] === 'object') {
+          scan(obj[k]);
+        }
+      }
+    }
+  };
+  scan(p);
+}
+
+// --- Attach WS ---
 function attachWs(ws){
   ws.on("open", async () => {
     sessionStartTs = Date.now();
     pushLog("WS_OPEN");
-
     const token = await fetchToken();
     ws.send(JSON.stringify({ id:1, connect:{ token, subs:{} } }));
-
     setTimeout(()=>{
       ws.send(JSON.stringify({ id:100, subscribe:{ channel:CHANNEL } }));
     },200);
   });
 
   ws.on("message", d => {
-    let p; try { p = JSON.parse(d); } catch {}
-    if (p?.push) return onPush(p);
-    if (p && Object.keys(p).length === 0) {
-      ws.send(JSON.stringify({ type:3 }));
-      lastPongTs = Date.now();
+    // Robust parsing: extract possibly multiple JSON objects from a single message
+    const parsedList = parsePossibleBatch(d);
+    if (parsedList.length === 0) {
+      // No JSON parsed — log and ignore
+      pushLog("UNPARSED_WS_FRAME", { preview: d.toString().slice(0,200) });
+      return;
+    }
+    for (const p of parsedList) {
+      // normalize: if message is envelope with "push"
+      if (p?.push) {
+        onPush(p);
+      } else {
+        // Some frames may be raw push under nested structure - try scan
+        onPush(p);
+      }
     }
   });
 
@@ -224,7 +332,9 @@ async function loop(){
       ws = new WebSocket(WS_URL);
       attachWs(ws);
       await new Promise(res=>ws.once("close",res));
-    } catch {}
+    } catch (e) {
+      pushLog("WS_LOOP_ERR", { error: String(e) });
+    }
     await new Promise(r=>setTimeout(r,2000));
   }
 }
@@ -232,6 +342,11 @@ async function loop(){
 http.createServer((req, res) => {
   if (req.url === "/game/history") {
     res.end(JSON.stringify({ count: finishedGames.length, games: finishedGames }, null, 2));
+    return;
+  }
+
+  if (req.url === "/debug/logs") {
+    res.end(JSON.stringify({ logs: logs.slice(-200) }, null, 2));
     return;
   }
 
