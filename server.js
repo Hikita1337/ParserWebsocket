@@ -60,17 +60,38 @@ let sentPlayersToAI = false;
 let sentDeltaLogForHUD = false;
 let startedStatus1Log = false;
 
+// --- Оптимизированная функция для извлечения всех ставок ---
+function extractBets(obj, bets = []) {
+  if (!obj || typeof obj !== "object") return bets;
+
+  // Ставка на текущем уровне
+  if (obj.bet) { bets.push(obj.bet); return bets; }
+  if (obj.b) { bets.push(obj.b); return bets; }
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) extractBets(item, bets);
+    return bets;
+  }
+
+  for (const key in obj) {
+    if (key === "bet" || key === "b" || typeof obj[key] === "object") {
+      extractBets(obj[key], bets);
+    }
+  }
+
+  return bets;
+}
+
+// --- Обработка ставки ---
 function handleBet(bet){
   if (!bet?.user?.id) return;
+
+  // Только при статусе 1
+  if (currentGame.status !== 1) return;
+
   const id = bet.user.id;
   const sum = Number(bet.deposit?.amount || 0);
   const auto = bet.coefficientAuto ?? null;
-
-  // Статус 1 — выводим лог "Собираю людей" только один раз
-  if (currentGame.status === 1 && !startedStatus1Log) {
-    console.log("[STATUS1] Собираю людей");
-    startedStatus1Log = true;
-  }
 
   if (!currentGame.players[id]) {
     currentGame.players[id] = {
@@ -80,39 +101,43 @@ function handleBet(bet){
       lastCoefficientAuto: auto
     };
   } else {
+    // Суммируем (хотя сайт запрещает больше одной ставки)
     currentGame.players[id].sum += sum;
     currentGame.players[id].lastCoefficientAuto = auto;
   }
+
+  // Лог один раз при начале статуса 1
+  if (!startedStatus1Log) {
+    console.log("[STATUS1] Собираю игроков");
+    startedStatus1Log = true;
+  }
 }
 
+// --- Обработка обновления статуса ---
 function handleUpdate(data){
   if (data.id) currentGame.gameId = data.id;
   if (typeof data.status === "number") currentGame.status = data.status;
   if (typeof data.delta === "number") currentGame.delta = data.delta;
 
-  // Сброс флага при выходе из статуса 1
   if (currentGame.status !== 1) startedStatus1Log = false;
 
   // Статус 1 → 2 впервые
   if (currentGame.status === 2 && !sentPlayersToAI) {
-    const arr = Object.values(currentGame.players);
+    const arr = Object.values(currentGame.players); // уникальные игроки
     const totalPlayers = arr.length;
     const totalDeposit = arr.reduce((s,p)=>s+p.sum,0);
 
-    // Логируем только агрегированно
-    console.log(`[AI] Игроки найдены | количество: ${totalPlayers} | сумма ставок: ${totalDeposit}`);
-
+    console.log(`[AI] Игроки собраны | количество: ${totalPlayers} | сумма ставок: ${totalDeposit}`);
     pushLog("SEND_TO_AI", {
         gameId: currentGame.gameId,
         message: "Игроки собраны",
         totalPlayers,
         totalDeposit
     });
-    
+
     sentPlayersToAI = true;
   }
 
-  // Статус 2 — дельта HUD один раз
   if (currentGame.status === 2 && !sentDeltaLogForHUD) {
     console.log(`[HUD] delta START => ${currentGame.delta}`);
     pushLog("HUD_DELTA_START", { delta: currentGame.delta });
@@ -120,6 +145,7 @@ function handleUpdate(data){
   }
 }
 
+// --- Финализация игры ---
 function finalizeGame(data){
   const gameId = data.id || data.gameId || currentGame.gameId;
   const crash = data.crash;
@@ -129,10 +155,8 @@ function finalizeGame(data){
   const totalPlayers = playersArr.length;
   const totalDeposit = playersArr.reduce((s,p)=>s+p.sum,0);
 
-  // Отправка AI + HUD в одну строку
   console.log(`[AI] game=${gameId} crash=${crash} color=${color} + [HUD] crash=${crash}`);
 
-  // Подготовка объекта для базы
   const final = {
     gameId,
     crash,
@@ -143,32 +167,36 @@ function finalizeGame(data){
     ts: nowIso()
   };
 
-  // Заглушка сохранения в базу
-  // saveToDB(final);
   console.log(`[DB] Игра сохранена game=${gameId} crash=${crash} players=${totalPlayers} totalDeposit=${totalDeposit}`);
 
   finishedGames.unshift(final);
   if (finishedGames.length > 1) finishedGames.pop();
 
-  // Очистка текущей игры
   currentGame = { gameId: null, status: null, players: {}, totalPlayers: 0, totalDeposit: 0, delta: null };
   sentPlayersToAI = false;
   sentDeltaLogForHUD = false;
   startedStatus1Log = false;
 }
 
+// --- Обработка сообщений WS ---
 function onPush(msg){
   const data = msg.push?.pub?.data;
   if (!data) return;
 
-  const t = data.type;
+  const type = data.type;
 
-  if (t === "update") return handleUpdate(data);
-  if (t === "betCreated" || t === "bet") return handleBet(data.bet || data);
-  if (t === "topBetCreated") return;
-  if (t === "crash" || t === "end") return finalizeGame(data);
+  if (type === "crash" || type === "end") return finalizeGame(data);
+
+  if (type === "update") handleUpdate(data);
+
+  // Сбор ставок только при статусе 1
+  if (currentGame.status === 1) {
+    const bets = extractBets(data);
+    bets.forEach(handleBet);
+  }
 }
 
+// --- Подключение WebSocket ---
 function attachWs(ws){
   ws.on("open", async () => {
     sessionStartTs = Date.now();
@@ -184,7 +212,7 @@ function attachWs(ws){
     let p; try { p = JSON.parse(d); } catch {}
     if (p?.push) return onPush(p);
     if (p && Object.keys(p).length === 0) {
-      ws.send(JSON.stringify({ type:3 })); // pong
+      ws.send(JSON.stringify({ type:3 }));
       lastPongTs = Date.now();
     }
   });
@@ -204,6 +232,7 @@ async function loop(){
     await new Promise(r=>setTimeout(r,2000));
   }
 }
+
 http.createServer((req, res) => {
   if (req.url === "/game/history") {
     res.end(JSON.stringify({ count: finishedGames.length, games: finishedGames }, null, 2));
@@ -217,15 +246,8 @@ http.createServer((req, res) => {
     console.log("[SERVER] Shutdown initiated via /shutdown endpoint");
     pushLog({ type: "shutdown_endpoint", reason: "manual_request" });
 
-    // Остановить основной цикл и закрыть WS
     running = false;
-    try {
-      if (ws) ws.close();
-    } catch (e) {
-      console.error("[SERVER] Error closing WS:", e.message);
-    }
-
-    // Небольшая задержка перед полным выходом, чтобы обработались события
+    try { if (ws) ws.close(); } catch(e) { console.error("[SERVER] Error closing WS:", e.message); }
     setTimeout(() => process.exit(0), 500);
     return;
   }
