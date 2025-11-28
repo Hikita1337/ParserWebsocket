@@ -148,7 +148,7 @@ function finalizeGame(data){
   console.log(`[DB] Игра сохранена game=${gameId} crash=${crash} players=${totalPlayers} totalDeposit=${totalDeposit}`);
 
   finishedGames.unshift(final);
-  if (finishedGames.length > 2) finishedGames.pop();
+  if (finishedGames.length > 1) finishedGames.pop();
 
   // Очистка текущей игры
   currentGame = { gameId: null, status: null, players: {}, totalPlayers: 0, totalDeposit: 0, delta: null };
