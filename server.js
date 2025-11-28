@@ -265,3 +265,34 @@ http.createServer((req, res) => {
 }).listen(PORT, () => console.log("HTTP listen", PORT));
 
 loop();
+
+// =============================
+//       KEEP-ALIVE FOR RENDER
+// =============================
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || "https://parserwebsocket.onrender.com" ;
+
+function keepAlive() {
+  if (!SELF_URL) return;
+
+  const delay = 240000 + Math.random() * 120000; // 4–6 минут
+
+  setTimeout(async () => {
+    try {
+      await fetch(SELF_URL + "/healthz", {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "X-Keep-Alive": String(Math.random()),
+        },
+      });
+
+      console.log("Keep-alive ping OK");
+    } catch (e) {
+      console.log("Keep-alive error:", e.message);
+    }
+
+    keepAlive();
+  }, delay);
+}
+
+keepAlive();
