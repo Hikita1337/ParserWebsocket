@@ -142,7 +142,7 @@ function finalizeGame(data){
   };
 
   finishedGames.unshift(finalRecord);
-  if (finishedGames.length > 50) finishedGames.pop();
+  if (finishedGames.length > 1) finishedGames.pop();
 
   console.log(`[DB] Game saved: players=${totalPlayers}`);
 
