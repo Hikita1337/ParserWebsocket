@@ -25,7 +25,7 @@ let currentGame = {
   delta: null
 };
 
-let collectingBets = false; // <--- ВАЖНО: флаг включения сбора ставок
+let collectingBets = false; // флаг сбора ставок — мы теперь включаем его после finalizeGame
 
 const finishedGames = [];
 const logs = [];
@@ -67,7 +67,7 @@ let startedStatus1Log = false;
 function handleBet(bet){
   if (!bet?.user?.id) return;
 
-  if (!collectingBets) return; // <--- Гарантия: собираем только в статусе 1
+  if (!collectingBets) return; // не собираем, если отключено
 
   const id = bet.user.id;
   const sum = Number(bet.deposit?.amount || 0);
@@ -81,13 +81,12 @@ function handleBet(bet){
       lastCoefficientAuto: auto
     };
   } else {
-    // Сайт НЕ даёт ставить повторно, но оставляю на всякий
     currentGame.players[id].sum += sum;
     currentGame.players[id].lastCoefficientAuto = auto;
   }
 
   if (!startedStatus1Log) {
-    console.log("[STATUS1] Собираю игроков");
+    console.log("[COLLECT] Собираю игроков");
     startedStatus1Log = true;
   }
 }
@@ -100,19 +99,22 @@ function handleUpdate(data){
   if (typeof data.status === "number") {
     currentGame.status = data.status;
 
-    // ВКЛЮЧЕНИЕ/ВЫКЛЮЧЕНИЕ СБОРА СТАВОК
-    if (data.status === 1) {
-      collectingBets = true;     // ← включаем сбор ставок
-    } else {
-      collectingBets = false;    // ← выключаем
+    // ВАЖНО: теперь статус 1 НЕ включает сбор ставок
+    // collectingBets включается ТОЛЬКО после finalizeGame()
+
+    // Статус 2 ОСТАНАВЛИВАЕТ сбор ставок
+    if (data.status === 2) {
+      collectingBets = false;
     }
   }
 
   if (typeof data.delta === "number") currentGame.delta = data.delta;
 
-  if (currentGame.status !== 1) startedStatus1Log = false;
+  if (currentGame.status !== 1) {
+    startedStatus1Log = false;
+  }
 
-  // Когда статус 1 → 2 — отправляем игроков
+  // Когда статус 2 — фиксируем игроков и старт делты
   if (currentGame.status === 2 && !sentPlayersToAI) {
     const arr = Object.values(currentGame.players);
     const totalPlayers = arr.length;
@@ -165,12 +167,23 @@ function finalizeGame(data){
   finishedGames.unshift(final);
   if (finishedGames.length > 1) finishedGames.pop();
 
-  // Полный сброс состояния игры
-  currentGame = { gameId: null, status: null, players: {}, totalPlayers: 0, totalDeposit: 0, delta: null };
+  // --- ПОЛНЫЙ СБРОС ИГРЫ ---
+  currentGame = {
+    gameId: null,
+    status: null,
+    players: {},
+    totalPlayers: 0,
+    totalDeposit: 0,
+    delta: null
+  };
+
   sentPlayersToAI = false;
   sentDeltaLogForHUD = false;
   startedStatus1Log = false;
-  collectingBets = false;
+
+  // ВАЖНО ❗: НОВАЯ ИГРА — НАЧИНАЕМ СОБИРАТЬ СТАВКИ
+  collectingBets = true;
+  console.log("[NEW_GAME] Приём ставок включён сразу после финализации");
 }
 
 
@@ -181,11 +194,14 @@ function onPush(msg){
 
   const type = data.type;
 
-  if (type === "crash" || type === "end") return finalizeGame(data);
+  if (type === "crash" || type === "end") {
+    return finalizeGame(data);
+  }
 
-  if (type === "update") return handleUpdate(data);
+  if (type === "update") {
+    return handleUpdate(data);
+  }
 
-  // Ставки идут ТОЛЬКО из betCreated
   if (type === "betCreated" && collectingBets) {
     handleBet(data.bet);
   }
