@@ -55,14 +55,22 @@ function colorForCrash(c){
   return "gradient";
 }
 
+// Флаги для логов
 let sentPlayersToAI = false;
 let sentDeltaLogForHUD = false;
+let startedStatus1Log = false;
 
 function handleBet(bet){
   if (!bet?.user?.id) return;
   const id = bet.user.id;
   const sum = Number(bet.deposit?.amount || 0);
   const auto = bet.coefficientAuto ?? null;
+
+  // Статус 1 — выводим лог "Собираю людей" только один раз
+  if (currentGame.status === 1 && !startedStatus1Log) {
+    console.log("[STATUS1] Собираю людей");
+    startedStatus1Log = true;
+  }
 
   if (!currentGame.players[id]) {
     currentGame.players[id] = {
@@ -74,6 +82,41 @@ function handleBet(bet){
   } else {
     currentGame.players[id].sum += sum;
     currentGame.players[id].lastCoefficientAuto = auto;
+  }
+}
+
+function handleUpdate(data){
+  if (data.id) currentGame.gameId = data.id;
+  if (typeof data.status === "number") currentGame.status = data.status;
+  if (typeof data.delta === "number") currentGame.delta = data.delta;
+
+  // Сброс флага при выходе из статуса 1
+  if (currentGame.status !== 1) startedStatus1Log = false;
+
+  // Статус 1 → 2 впервые
+  if (currentGame.status === 2 && !sentPlayersToAI) {
+    const arr = Object.values(currentGame.players);
+    const totalPlayers = arr.length;
+    const totalDeposit = arr.reduce((s,p)=>s+p.sum,0);
+
+    // Логируем только агрегированно
+    console.log(`[AI] Игроки найдены | количество: ${totalPlayers} | сумма ставок: ${totalDeposit}`);
+
+    pushLog("SEND_TO_AI", {
+        gameId: currentGame.gameId,
+        message: "Игроки собраны",
+        totalPlayers,
+        totalDeposit
+    });
+    
+    sentPlayersToAI = true;
+  }
+
+  // Статус 2 — дельта HUD один раз
+  if (currentGame.status === 2 && !sentDeltaLogForHUD) {
+    console.log(`[HUD] delta START => ${currentGame.delta}`);
+    pushLog("HUD_DELTA_START", { delta: currentGame.delta });
+    sentDeltaLogForHUD = true;
   }
 }
 
@@ -94,47 +137,23 @@ function finalizeGame(data){
   finishedGames.unshift(final);
   if (finishedGames.length > 500) finishedGames.pop();
 
-  pushLog("GAME_FINAL", final);
+  // Лог финала
+  pushLog("GAME_FINAL", { gameId, crash, color, totalPlayers, totalDeposit });
 
-  // Отправки заглушки
+  // Отправка в AI
   console.log(`[AI] crash => game=${gameId} crash=${crash} color=${color}`);
+
+  // Отправка финального краша в HUD
   console.log(`[HUD] final crash => ${crash}`);
+
+  // Здесь по логике можно сохранить в базу:
+  // saveToDB(final);
 
   // Очистка
   currentGame = { gameId: null, status: null, players: {}, totalPlayers: 0, totalDeposit: 0, delta: null };
   sentPlayersToAI = false;
   sentDeltaLogForHUD = false;
-}
-
-function handleUpdate(data){
-  if (data.id) currentGame.gameId = data.id;
-  if (data.status != null) currentGame.status = data.status;
-  if (typeof data.delta === "number") currentGame.delta = data.delta;
-
-  // Когда 1 → 2 впервые
-  if (currentGame.status === 2 && !sentPlayersToAI) {
-    const arr = Object.values(currentGame.players);
-    const totalPlayers = arr.length;
-    const totalDeposit = arr.reduce((s,p)=>s+p.sum,0);
-
-    // Скрываем массив игроков — выводим только агрегированную информацию
-    console.log(`[AI] Игроки найдены | количество: ${totalPlayers} | сумма ставок: ${totalDeposit}`);
-
-    pushLog("SEND_TO_AI", {
-        gameId: currentGame.gameId,
-        message: "Игроки собраны",
-        totalPlayers,
-        totalDeposit
-    });
-    
-    sentPlayersToAI = true;
-  }
-
-  if (currentGame.status === 2 && !sentDeltaLogForHUD) {
-    console.log(`[HUD] delta START => ${currentGame.delta}`);
-    pushLog("HUD_DELTA_START", { delta: currentGame.delta });
-    sentDeltaLogForHUD = true;
-  }
+  startedStatus1Log = false;
 }
 
 function onPush(msg){
