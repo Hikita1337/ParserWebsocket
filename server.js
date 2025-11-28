@@ -1,4 +1,4 @@
-// server.js — Crash Parser (robust message parsing)
+// server.js — Crash Parser (robust message parsing + heartbeat)
 // Установка: npm i ws node-fetch
 
 import WebSocket from "ws";
@@ -17,12 +17,12 @@ let lastPongTs = null;
 
 let currentGame = {
   gameId: null,
-  status: null,   // 1 = accepting bets, 2 = delta, null = unknown/new
+  status: null,
   delta: null,
-  players: {}     // key = userId
+  players: {}
 };
 
-let collectingBets = true; // enabled after cache cleared (finalizeGame sets it)
+let collectingBets = true;
 const finishedGames = [];
 const logs = [];
 
@@ -60,21 +60,14 @@ let sentDeltaLogForHUD = false;
 // --- Bet handling ---
 function handleBet(bet){
   if (!bet?.user?.id) return;
-
-  // Accept only if:
-  //  - bet.status === 1 (explicit from WS)
-  //  - AND collectingBets is true (we are in new-game mode)
   if (!collectingBets) return;
   if (Number(bet.status) !== 1) return;
 
-  // If parser hasn't seen an update status=1 yet, but bet.status===1 —
-  // infer currentGame.status = 1 (helps with race conditions).
   if (currentGame.status !== 1) {
     currentGame.status = 1;
     pushLog("INFER_STATUS_1", { fromBetId: bet.id, gameId: bet.gameId });
   }
 
-  // Ensure gameId is populated
   if (!currentGame.gameId && bet.gameId) currentGame.gameId = bet.gameId;
 
   const id = bet.user.id;
@@ -97,25 +90,16 @@ function handleBet(bet){
 // --- Update handling ---
 function handleUpdate(data){
   if (data.id) currentGame.gameId = data.id;
-
-  if (typeof data.status === "number") {
-    currentGame.status = data.status;
-  }
+  if (typeof data.status === "number") currentGame.status = data.status;
   if (typeof data.delta === "number") currentGame.delta = data.delta;
 
   if (currentGame.status === 2) {
-    // When status becomes 2 — we should snapshot players and send to AI (once)
     if (!sentPlayersToAI) {
       const arr = Object.values(currentGame.players);
       const totalPlayers = arr.length;
       const totalDeposit = arr.reduce((s,p)=>s+p.sum,0);
 
-      pushLog("SEND_TO_AI", {
-        gameId: currentGame.gameId,
-        totalPlayers,
-        totalDeposit
-      });
-
+      pushLog("SEND_TO_AI", { gameId: currentGame.gameId, totalPlayers, totalDeposit });
       sentPlayersToAI = true;
     }
 
@@ -123,8 +107,6 @@ function handleUpdate(data){
       pushLog("HUD_DELTA_START", { delta: currentGame.delta });
       sentDeltaLogForHUD = true;
     }
-
-    // Important: do NOT flip collectingBets here; bets will be filtered by bet.status === 1.
   }
 }
 
@@ -140,65 +122,42 @@ function finalizeGame(data){
 
   pushLog("FINALIZE_GAME", { gameId, crash, color, totalPlayers, totalDeposit });
 
-  const final = {
-    gameId,
-    crash,
-    color,
-    players: playersArr,
-    totalPlayers,
-    totalDeposit,
-    ts: nowIso()
-  };
+  const final = { gameId, crash, color, players: playersArr, totalPlayers, totalDeposit, ts: nowIso() };
 
-  // DB write placeholder (replace with your function)
-  // saveGameToDb(final).catch(...)
+  // Заглушка: записать в БД здесь (заменить на свою функцию)
+  // saveGame(final)
 
   finishedGames.unshift(final);
   if (finishedGames.length > 100) finishedGames.pop();
 
-  // Clear state (cache) AFTER DB write
-  currentGame = {
-    gameId: null,
-    status: null,
-    delta: null,
-    players: {}
-  };
-
+  // Очистка кэша
+  currentGame = { gameId: null, status: null, delta: null, players: {} };
   sentPlayersToAI = false;
   sentDeltaLogForHUD = false;
 
-  // Enable collecting bets for the next game
+  // Включаем сбор ставок для новой игры
   collectingBets = true;
   pushLog("NEW_GAME_READY", { msg: "Cache cleared, collecting bets enabled" });
 }
 
-// --- Robust single-message parsing ---
-// Some incoming frames contain multiple JSON objects concatenated.
-// This function extracts JSON objects and returns array of parsed objects.
+// --- Robust parse for multiple JSON objects in one frame ---
 function parsePossibleBatch(raw){
   const results = [];
-
-  // If already an object (ws may deliver parsed objects sometimes)
   if (typeof raw === 'object' && raw !== null) {
     results.push(raw);
     return results;
   }
 
-  // raw is Buffer or string
   let s = raw.toString();
 
-  // Fast path: single valid JSON
   try {
     const parsed = JSON.parse(s);
     results.push(parsed);
     return results;
   } catch (e) {
-    // fallback to extract multiple JSON blocks
+    // continue to fragment extraction
   }
 
-  // Heuristic extraction:
-  // Replace "}\n{" and "}{", then try split by newline boundaries
-  // We'll scan for balanced braces and extract objects.
   let depth = 0;
   let start = null;
   for (let i = 0; i < s.length; i++) {
@@ -214,17 +173,17 @@ function parsePossibleBatch(raw){
           const parsed = JSON.parse(piece);
           results.push(parsed);
         } catch (e) {
-          // ignore parse failure for this piece but log for debugging
-          pushLog("PARSE_FRAGMENT_FAIL", { fragment: piece.slice(0,200) });
+          // debug, but keep processing
+          pushLog("PARSE_FRAGMENT_FAIL", { fragmentPreview: piece.slice(0,200) });
         }
         start = null;
       }
     }
   }
 
-  // If nothing parsed, as last resort try to find top-level "push" objects via regex
   if (results.length === 0) {
-    const re = /{\"push\":.*?\}\}\}/g; // best-effort (will match some)
+    // best-effort detection for common push envelope
+    const re = /\{\"push\":\{.*?\}\}\}/g;
     let m;
     while ((m = re.exec(s)) !== null) {
       try {
@@ -237,7 +196,7 @@ function parsePossibleBatch(raw){
   return results;
 }
 
-// --- onPush (process a single push entry) ---
+// --- Process one push object ---
 function onPushSingle(pushObj){
   const data = pushObj.pub?.data;
   if (!data) return;
@@ -247,34 +206,25 @@ function onPushSingle(pushObj){
     finalizeGame(data);
     return;
   }
-
   if (type === "update") {
     handleUpdate(data);
     return;
   }
-
-  // We only care about betCreated (ignore topBetCreated)
   if (type === "betCreated") {
     handleBet(data.bet);
     return;
   }
-
-  // ignore others but useful to log rare ones
-  // pushLog("IGNORED_PUSH", { type });
+  // ignore other types (topBetCreated, changeStatistic, etc.)
 }
 
-// --- main onPush for the parsed object(s) ---
+// --- High-level onPush that scans nested envelopes ---
 function onPush(p){
-  // p may contain push or be multiple; handle safely
   if (!p) return;
-
-  // If object is single push
   if (p.push && p.push.pub && p.push.pub.data) {
     onPushSingle(p.push);
     return;
   }
 
-  // If it's an envelope array or similar, try to find push.* entries
   const scan = (obj) => {
     if (!obj || typeof obj !== 'object') return;
     if (obj.push && obj.push.pub && obj.push.pub.data) {
@@ -290,42 +240,65 @@ function onPush(p){
   scan(p);
 }
 
-// --- Attach WS ---
+// --- Attach WS with heartbeat recovery ---
 function attachWs(ws){
   ws.on("open", async () => {
     sessionStartTs = Date.now();
     pushLog("WS_OPEN");
     const token = await fetchToken();
-    ws.send(JSON.stringify({ id:1, connect:{ token, subs:{} } }));
-    setTimeout(()=>{
-      ws.send(JSON.stringify({ id:100, subscribe:{ channel:CHANNEL } }));
-    },200);
+    try {
+      ws.send(JSON.stringify({ id:1, connect:{ token, subs:{} } }));
+      setTimeout(()=> ws.send(JSON.stringify({ id:100, subscribe:{ channel:CHANNEL } })), 200);
+    } catch (e) {
+      pushLog("WS_SEND_ERR", { error: String(e) });
+    }
   });
 
   ws.on("message", d => {
-    // Robust parsing: extract possibly multiple JSON objects from a single message
+    // Try robust parse
     const parsedList = parsePossibleBatch(d);
+
+    // If nothing parsed, we still reply with keepalive to avoid server closing
     if (parsedList.length === 0) {
-      // No JSON parsed — log and ignore
+      // Some servers send an empty object as ping: {}
+      try {
+        // respond with type:3 (centrifuge ping/pong semantics)
+        ws.send(JSON.stringify({ type: 3 }));
+        lastPongTs = Date.now();
+      } catch (e) {
+        pushLog("WS_PONG_SEND_ERR", { error: String(e) });
+      }
       pushLog("UNPARSED_WS_FRAME", { preview: d.toString().slice(0,200) });
       return;
     }
+
     for (const p of parsedList) {
-      // normalize: if message is envelope with "push"
-      if (p?.push) {
-        onPush(p);
-      } else {
-        // Some frames may be raw push under nested structure - try scan
-        onPush(p);
+      try {
+        if (p?.push) {
+          onPush(p);
+        } else {
+          onPush(p);
+        }
+      } catch (e) {
+        pushLog("ONPUSH_ERR", { error: String(e), preview: JSON.stringify(p).slice(0,200) });
       }
     }
   });
 
+  // Some servers use WebSocket pong frames; keep track
   ws.on("pong", ()=> lastPongTs = Date.now());
-  ws.on("close", ()=> pushLog("WS_CLOSE"));
-  ws.on("error", e=> pushLog("WS_ERROR",{error:String(e)}));
+
+  // If server sends an empty JSON object as a keepalive, it will appear parsed as {}
+  // In some runs we receive that as parsed object; respond to it:
+  // (Handled above in parse branch when parsedList is empty we send type:3)
+
+  ws.on("close", (code, reason) => {
+    pushLog("WS_CLOSE", { code, reason: reason && reason.toString ? reason.toString() : reason });
+  });
+  ws.on("error", e => pushLog("WS_ERROR", { error: String(e) }));
 }
 
+// --- main loop ---
 async function loop(){
   while (running){
     try{
@@ -335,6 +308,7 @@ async function loop(){
     } catch (e) {
       pushLog("WS_LOOP_ERR", { error: String(e) });
     }
+    // backoff before reconnect
     await new Promise(r=>setTimeout(r,2000));
   }
 }
@@ -363,34 +337,3 @@ http.createServer((req, res) => {
 }).listen(PORT, () => console.log("HTTP listen", PORT));
 
 loop();
-
-// =============================
-//       KEEP-ALIVE FOR RENDER
-// =============================
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || "https://parserwebsocket.onrender.com" ;
-
-function keepAlive() {
-  if (!SELF_URL) return;
-
-  const delay = 240000 + Math.random() * 120000; // 4–6 минут
-
-  setTimeout(async () => {
-    try {
-      await fetch(SELF_URL + "/healthz", {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          "X-Keep-Alive": String(Math.random()),
-        },
-      });
-
-      console.log("Keep-alive ping OK");
-    } catch (e) {
-      console.log("Keep-alive error:", e.message);
-    }
-
-    keepAlive();
-  }, delay);
-}
-
-keepAlive();
