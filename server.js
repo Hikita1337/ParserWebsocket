@@ -117,9 +117,16 @@ function handleUpdate(data){
     const totalPlayers = arr.length;
     const totalDeposit = arr.reduce((s,p)=>s+p.sum,0);
 
-    console.log(`[AI] players => game=${currentGame.gameId} players=${totalPlayers} total=${totalDeposit}`);
-    pushLog("SEND_TO_AI", { gameId: currentGame.gameId, totalPlayers, totalDeposit });
+    // Скрываем массив игроков — выводим только агрегированную информацию
+    console.log(`[AI] Игроки найдены | количество: ${totalPlayers} | сумма ставок: ${totalDeposit}`);
 
+    pushLog("SEND_TO_AI", {
+        gameId: currentGame.gameId,
+        message: "Игроки собраны",
+        totalPlayers,
+        totalDeposit
+    });
+    
     sentPlayersToAI = true;
   }
 
