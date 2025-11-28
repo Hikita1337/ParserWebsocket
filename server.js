@@ -60,22 +60,30 @@ let sentPlayersToAI = false;
 let sentDeltaLogForHUD = false;
 let startedStatus1Log = false;
 
-// --- Оптимизированная функция для извлечения всех ставок ---
-function extractBets(obj, bets = []) {
+// --- Рекурсивная и безопасная функция для извлечения всех ставок ---
+function extractAllBets(obj, bets = []) {
   if (!obj || typeof obj !== "object") return bets;
 
-  // Ставка на текущем уровне
-  if (obj.bet) { bets.push(obj.bet); return bets; }
-  if (obj.b) { bets.push(obj.b); return bets; }
+  const stack = [obj];
 
-  if (Array.isArray(obj)) {
-    for (const item of obj) extractBets(item, bets);
-    return bets;
-  }
+  while (stack.length) {
+    const current = stack.pop();
+    if (!current || typeof current !== "object") continue;
 
-  for (const key in obj) {
-    if (key === "bet" || key === "b" || typeof obj[key] === "object") {
-      extractBets(obj[key], bets);
+    // Добавляем все ставки на этом уровне
+    if (current.bet) bets.push(current.bet);
+    if (current.b) bets.push(current.b);
+
+    // Если массив — добавляем элементы в стек
+    if (Array.isArray(current)) {
+      for (let i = current.length - 1; i >= 0; i--) stack.push(current[i]);
+      continue;
+    }
+
+    // Добавляем все объекты в стек
+    for (const key in current) {
+      const value = current[key];
+      if (value && typeof value === "object") stack.push(value);
     }
   }
 
@@ -101,7 +109,6 @@ function handleBet(bet){
       lastCoefficientAuto: auto
     };
   } else {
-    // Суммируем (хотя сайт запрещает больше одной ставки)
     currentGame.players[id].sum += sum;
     currentGame.players[id].lastCoefficientAuto = auto;
   }
@@ -189,9 +196,9 @@ function onPush(msg){
 
   if (type === "update") handleUpdate(data);
 
-  // Сбор ставок только при статусе 1
+  // Сбор всех ставок только при статусе 1
   if (currentGame.status === 1) {
-    const bets = extractBets(data);
+    const bets = extractAllBets(data);
     bets.forEach(handleBet);
   }
 }
